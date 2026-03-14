@@ -15,7 +15,7 @@ from utils_KQD import make_U, make_basis, make_S, make_Hsub, solve_generalized_e
 from utils_general import setup_gpu, setup_logger, save_plt, save_plotly, save_csv
 
 COMPUTE_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-num_qubit = 4
+num_qubit = 8
 GPU_id = 0
 
 
@@ -63,34 +63,52 @@ class GPTQE(GPT):
         return idx, total_energy
 
 
-# 1) KQD용 Hamiltonian / U / Ritz 에너지 계산 함수들
-
-def make_H_4qubit_arbitrary():
+# Problem Hamiltonian
+def make_H_3_local_ata(num_qubit):
     """
-    4-qubit chain Heisenberg-like Hamiltonian:
-    H = sum_i ( a_i XX_{i,i+1} + b_i YY_{i,i+1} + c_i ZZ_{i,i+1} )
+    B-style fixed (non-random):
+      - all-to-all 2-local: for all i<j add XX,YY,ZZ
+      - + some 3-local mixed-Pauli terms (local triples)
+      - + small 1-local fields to break symmetry
     """
-    ops = []
-    coeffs = []
+    ops, coeffs = [], []
 
-    a = [7.0, 12.0, 9.0]  # XX 계수들 (0-1, 1-2, 2-3)
-    b = [11.0, 8.0, 13.0]  # YY 계수들
-    c = [5.0, 6.0, 4.0]  # ZZ 계수들
+    # 2-local all-to-all
+    pairs = [(i, j) for i in range(num_qubit) for j in range(i + 1, num_qubit)]
+    for idx, (i, j) in enumerate(pairs):
+        Jxx = float(7 + (3 * idx) % 17)
+        Jyy = float(5 + (5 * idx) % 19)
+        Jzz = float(3 + (7 * idx) % 23)
+        ops.append(qml.PauliX(i) @ qml.PauliX(j)); coeffs.append(Jxx)
+        ops.append(qml.PauliY(i) @ qml.PauliY(j)); coeffs.append(Jyy)
+        ops.append(qml.PauliZ(i) @ qml.PauliZ(j)); coeffs.append(Jzz)
 
-    for i in range(num_qubit - 1):
-        ops.append(qml.PauliX(i) @ qml.PauliX(i + 1))
-        coeffs.append(a[i])
-        ops.append(qml.PauliY(i) @ qml.PauliY(i + 1))
-        coeffs.append(b[i])
-        ops.append(qml.PauliZ(i) @ qml.PauliZ(i + 1))
-        coeffs.append(c[i])
+    # 1-local fields (light)
+    for i in range(num_qubit):
+        if i % 2 == 0:
+            ops.append(qml.PauliX(i)); coeffs.append(4.0 + (i % 3))
+        if i % 3 == 0:
+            ops.append(qml.PauliZ(i)); coeffs.append(6.0 + (i % 4))
+
+    # 3-local terms: only consecutive triples to keep term count reasonable
+    triples = [(i, i + 1, i + 2) for i in range(num_qubit - 2)]
+    pauli_triple = [
+        (qml.PauliX, qml.PauliY, qml.PauliZ),
+        (qml.PauliX, qml.PauliZ, qml.PauliY),
+        (qml.PauliY, qml.PauliX, qml.PauliZ),
+        (qml.PauliZ, qml.PauliX, qml.PauliY),
+    ]
+    for t, (i, j, k) in enumerate(triples):
+        P1, P2, P3 = pauli_triple[t % 4]
+        ops.append(P1(i) @ P2(j) @ P3(k))
+        coeffs.append(float(21 + (2 * t) % 11))
 
     H_op = qml.Hamiltonian(coeffs, ops)
-    H_mat = qml.matrix(H_op, wire_order=range(num_qubit)).astype(np.complex128)  # 16x16
+    H_mat = qml.matrix(H_op, wire_order=list(range(num_qubit))).astype(np.complex128)
     return H_op, H_mat
 
 
-# ---- 전역 공유 (multiprocessing worker가 재사용하게) ----
+# ---- multiprocessing worker ----
 quantum_device = None
 
 def _worker_init():
@@ -135,7 +153,7 @@ if __name__ == "__main__":
     os.makedirs(outdir, exist_ok=True)
 
     # ===== Hyperparameters(workers, GQE, Training, KQD, X, evaluation samples k) =====
-    num_workers = 8  # 8
+    num_workers = 16  # 8
 
     num_feat = 8
     num_scale = 5
@@ -144,23 +162,22 @@ if __name__ == "__main__":
     op_pool = make_op_pool(gate_type=gate_type, num_qubit=num_qubit, num_param=num_feat, param_scale=param_scale)
     op_pool_size = len(op_pool)
 
-    train_size = 32  # 256
+    train_size = 256  # 256
     n_batches = 4
     max_gate = 28
-    max_epoch = 5  # 500
+    max_epoch = 10  # 2000
     T_max = 100
     T_min = 0.04
 
     krylov_n = 3
     t_evol = 0.2
 
-    fixed_x = torch.linspace(0.1, 2 * np.pi, steps=num_feat).float()  # 왜 이건 안될까?
     fixed_x = torch.linspace(0.1, 1.0, steps=num_feat).float()
 
     top_k = 10
 
     # ===== Preparing Hamiltonian =====
-    H_op, H_mat = make_H_4qubit_arbitrary()
+    H_op, H_mat = make_H_3_local_ata(num_qubit)
     U_mat = make_U(H_mat, t=t_evol)
 
     # exact ground (target)
