@@ -36,6 +36,7 @@ class GPTQE(GPT):
     def calculate_loss(self, tokens, energies):
         current_tokens, next_tokens = tokens[:, :-1], tokens[:, 1:]
         logits = self(current_tokens)
+
         next_token_mask = torch.nn.functional.one_hot(next_tokens, num_classes=self.config.vocab_size)
         next_token_logits = (logits * next_token_mask).sum(axis=2)
         total_logits = torch.sum(next_token_logits, dim=1)
